@@ -1,0 +1,980 @@
+#!/bin/zsh
+set -u
+setopt NULL_GLOB
+
+VERSION="0.2.0"
+SCRIPT_PATH="${0:A}"
+
+JSON_OUTPUT=0
+FORCE=0
+FIX_CONFIG=0
+ACTIVE_TOO=0
+INSTALL_PREFIX=""
+INSTALL_BIN_DIR=""
+
+CODEX_HOME_DIR="${CODEX_HOME:-${HOME}/.codex}"
+if [[ -n "${CODEX_AUTH_SNAP_HOME:-}" ]]; then
+  SWITCH_HOME_DIR="${CODEX_AUTH_SNAP_HOME}"
+elif [[ -n "${CODEX_AUTH_SWITCH_HOME:-}" ]]; then
+  SWITCH_HOME_DIR="${CODEX_AUTH_SWITCH_HOME}"
+elif [[ -n "${CODEX_SWAP_HOME:-}" ]]; then
+  SWITCH_HOME_DIR="${CODEX_SWAP_HOME}"
+else
+  SWITCH_HOME_DIR="${HOME}/.codex-auth-snap"
+fi
+
+AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
+CONFIG_FILE="${CODEX_HOME_DIR}/config.toml"
+ACCOUNTS_DIR="${SWITCH_HOME_DIR}/accounts"
+META_DIR="${SWITCH_HOME_DIR}/meta"
+BEFORE_LOGIN_DIR="${SWITCH_HOME_DIR}/before-login"
+CURRENT_FILE="${SWITCH_HOME_DIR}/current"
+PENDING_FILE="${SWITCH_HOME_DIR}/pending-login"
+INSTALL_META_FILE="${META_DIR}/install.json"
+LOCK_DIR="${SWITCH_HOME_DIR}/lock"
+
+LOCK_HELD=0
+
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-auth-snap [--json] init [--fix] [--force]
+  codex-auth-snap [--json] save <name> [--force]
+  codex-auth-snap [--json] use <name> [--force]
+  codex-auth-snap [--json] begin-login <name> [--force]
+  codex-auth-snap [--json] finish-login [name] [--force]
+  codex-auth-snap [--json] abort-login [--force]
+  codex-auth-snap [--json] install [--prefix <dir>|--bin-dir <dir>] [--force]
+  codex-auth-snap [--json] list
+  codex-auth-snap [--json] current
+  codex-auth-snap [--json] remove <name> [--active-too]
+  codex-auth-snap [--json] doctor
+  codex-auth-snap [--json] paths
+  codex-auth-snap [--json] version
+
+Local Codex ChatGPT auth.json snapshot switcher. It never calls the network and
+never calls codex logout.
+EOF
+}
+
+json_escape() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  print -r -- "${value}"
+}
+
+json_string() {
+  print -r -- "\"$(json_escape "${1:-}")\""
+}
+
+emit_ok() {
+  local text="$1"
+  local result_json
+  if (( $# >= 2 )); then
+    result_json="$2"
+  else
+    result_json="{}"
+  fi
+  if (( JSON_OUTPUT )); then
+    print -r -- "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${text}")}],\"structuredContent\":{\"result\":${result_json}},\"isError\":false}"
+  else
+    print -r -- "${text}"
+  fi
+}
+
+emit_error() {
+  local code="$1"
+  local message="$2"
+  local suggested_fix="${3:-Check the command arguments and local files, then retry.}"
+  local retryable="${4:-false}"
+  if (( JSON_OUTPUT )); then
+    print -r -- "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${message}")}],\"structuredContent\":{\"error\":{\"code\":$(json_string "${code}"),\"message\":$(json_string "${message}"),\"retryable\":${retryable},\"field_errors\":[],\"suggested_fix\":$(json_string "${suggested_fix}")}},\"isError\":true}"
+  else
+    print -u2 -- "ERROR: ${message}"
+  fi
+}
+
+fatal() {
+  local code="$1"
+  local message="$2"
+  local suggested_fix="${3:-Check the command arguments and local files, then retry.}"
+  local retryable="${4:-false}"
+  emit_error "${code}" "${message}" "${suggested_fix}" "${retryable}"
+  exit 1
+}
+
+warn() {
+  print -u2 -- "WARN: $*"
+}
+
+cleanup_lock() {
+  if (( LOCK_HELD )); then
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+  fi
+}
+
+trap cleanup_lock EXIT INT TERM
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fatal "dependency_missing" "Required command not found: $1" "Install or expose $1 on PATH before running codex-auth-snap."
+}
+
+refuse_symlink_path() {
+  local file_path="$1"
+  [[ -L "${file_path}" ]] && fatal "symlink_refused" "Refusing to use symlink path: ${file_path}" "Replace the symlink with a real file or directory."
+}
+
+ensure_dir_700() {
+  local file_path="$1"
+  refuse_symlink_path "${file_path}"
+  mkdir -p "${file_path}" || fatal "mkdir_failed" "Failed to create directory: ${file_path}" "Check filesystem permissions."
+  chmod 700 "${file_path}" || fatal "chmod_failed" "Failed to chmod 700: ${file_path}" "Check filesystem permissions."
+}
+
+ensure_dirs() {
+  ensure_dir_700 "${CODEX_HOME_DIR}"
+  ensure_dir_700 "${SWITCH_HOME_DIR}"
+  ensure_dir_700 "${ACCOUNTS_DIR}"
+  ensure_dir_700 "${META_DIR}"
+  ensure_dir_700 "${BEFORE_LOGIN_DIR}"
+  if [[ -e "${AUTH_FILE}" ]]; then
+    refuse_symlink_path "${AUTH_FILE}"
+    chmod 600 "${AUTH_FILE}" 2>/dev/null || true
+  fi
+}
+
+ensure_install_state_dirs() {
+  ensure_dir_700 "${SWITCH_HOME_DIR}"
+  ensure_dir_700 "${META_DIR}"
+}
+
+acquire_lock() {
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    fatal "lock_exists" "Another codex-auth-snap process is running." "Wait for it to finish, or remove a verified stale lock directory."
+  fi
+  LOCK_HELD=1
+  chmod 700 "${LOCK_DIR}" 2>/dev/null || true
+}
+
+absolute_path() {
+  local file_path="$1"
+  if [[ "${file_path}" == /* ]]; then
+    print -r -- "${file_path}"
+  else
+    print -r -- "${PWD}/${file_path}"
+  fi
+}
+
+selected_install_bin_dir() {
+  if [[ -n "${INSTALL_BIN_DIR}" ]]; then
+    absolute_path "${INSTALL_BIN_DIR}"
+  elif [[ -n "${INSTALL_PREFIX}" ]]; then
+    absolute_path "${INSTALL_PREFIX}/bin"
+  else
+    print -r -- "${HOME}/.local/bin"
+  fi
+}
+
+selected_install_path() {
+  print -r -- "$(selected_install_bin_dir)/codex-auth-snap"
+}
+
+name_is_valid() {
+  local name="${1:-}"
+  print -r -- "${name}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+}
+
+validate_name() {
+  local name="${1:-}"
+  if ! name_is_valid "${name}"; then
+    fatal "invalid_name" "Invalid account name: ${name}" "Use 1-64 chars matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$."
+  fi
+}
+
+require_regular_file() {
+  local file_path="$1"
+  local code="${2:-file_missing}"
+  local message="${3:-Missing file: ${file_path}}"
+  [[ -e "${file_path}" ]] || fatal "${code}" "${message}" "Create the file through the expected workflow, then retry."
+  refuse_symlink_path "${file_path}"
+  [[ -f "${file_path}" ]] || fatal "not_regular_file" "Path is not a regular file: ${file_path}" "Replace it with a regular file."
+  [[ -s "${file_path}" ]] || fatal "empty_file" "File is empty: ${file_path}" "Regenerate the file, then retry."
+}
+
+validate_json_file() {
+  local file_path="$1"
+  require_command plutil
+  require_regular_file "${file_path}" "file_missing" "Missing JSON file: ${file_path}"
+  plutil -convert json -o /dev/null "${file_path}" >/dev/null 2>&1 || fatal "invalid_json" "Invalid JSON file: ${file_path}" "Regenerate or fix the JSON file before retrying."
+}
+
+auth_looks_like_chatgpt() {
+  local file_path="$1"
+  local mode
+  mode="$(plutil -extract auth_mode raw -o - "${file_path}" 2>/dev/null || true)"
+  if [[ "${mode}" == "chatgpt" ]]; then
+    return 0
+  fi
+  plutil -extract tokens json -o /dev/null "${file_path}" >/dev/null 2>&1
+}
+
+auth_has_refresh_token() {
+  local file_path="$1"
+  plutil -extract tokens.refresh_token raw -o /dev/null "${file_path}" >/dev/null 2>&1
+}
+
+validate_auth_file() {
+  local file_path="$1"
+  local allow_force="${2:-0}"
+  [[ -e "${file_path}" ]] || fatal "auth_missing" "auth.json does not exist: ${file_path}" "Run codex login first, then retry."
+  validate_json_file "${file_path}"
+  if ! auth_looks_like_chatgpt "${file_path}"; then
+    if (( allow_force )); then
+      warn "auth.json does not look like Codex ChatGPT auth; continuing because --force was provided."
+    else
+      fatal "not_chatgpt_auth" "auth.json does not look like Codex ChatGPT auth." "Run codex login for a ChatGPT account, or rerun with --force if you have verified this file."
+    fi
+  fi
+}
+
+auth_validation_status() {
+  local file_path="$1"
+  local allow_force="${2:-0}"
+  [[ -e "${file_path}" ]] || return 1
+  refuse_symlink_path "${file_path}"
+  [[ -f "${file_path}" ]] || fatal "not_regular_file" "Path is not a regular file: ${file_path}" "Replace it with a regular file."
+  [[ -s "${file_path}" ]] || return 1
+  require_command plutil
+  plutil -convert json -o /dev/null "${file_path}" >/dev/null 2>&1 || return 1
+  if ! auth_looks_like_chatgpt "${file_path}"; then
+    (( allow_force )) && return 0
+    return 1
+  fi
+  return 0
+}
+
+sha256_file() {
+  require_command shasum
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+short_hash() {
+  local hash="$1"
+  print -r -- "${hash[1,12]}"
+}
+
+extract_cli_version() {
+  local file_path="$1"
+  local line
+  [[ -f "${file_path}" && ! -L "${file_path}" ]] || return 1
+  line="$(grep -E '^VERSION="[^"]+"' "${file_path}" | head -n 1 || true)"
+  [[ -n "${line}" ]] || return 1
+  line="${line#VERSION=\"}"
+  print -r -- "${line%%\"*}"
+}
+
+looks_like_codex_auth_snap() {
+  local file_path="$1"
+  [[ -f "${file_path}" && ! -L "${file_path}" ]] || return 1
+  grep -Fq 'Local Codex ChatGPT auth.json snapshot switcher' "${file_path}" || return 1
+  extract_cli_version "${file_path}" >/dev/null 2>&1
+}
+
+now_iso() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+now_stamp() {
+  date '+%Y%m%d-%H%M%S'
+}
+
+write_secure_text() {
+  local file_path="$1"
+  local text="$2"
+  local dir
+  dir="$(dirname "${file_path}")"
+  refuse_symlink_path "${dir}"
+  local tmp
+  tmp="$(mktemp "${dir}/.tmp.XXXXXX")" || fatal "tmp_failed" "Failed to create temp file under ${dir}" "Check filesystem permissions."
+  print -r -- "${text}" >"${tmp}" || fatal "write_failed" "Failed to write temp file: ${tmp}" "Check filesystem permissions."
+  chmod 600 "${tmp}" || fatal "chmod_failed" "Failed to chmod 600: ${tmp}" "Check filesystem permissions."
+  if [[ -L "${file_path}" ]]; then
+    rm -f "${tmp}" 2>/dev/null || true
+    fatal "symlink_refused" "Refusing to overwrite symlink file: ${file_path}" "Replace the symlink with a real file."
+  fi
+  mv -f "${tmp}" "${file_path}" || fatal "rename_failed" "Failed to move temp file into place: ${file_path}" "Check filesystem permissions."
+  chmod 600 "${file_path}" || fatal "chmod_failed" "Failed to chmod 600: ${file_path}" "Check filesystem permissions."
+}
+
+atomic_copy() {
+  local src="$1"
+  local dst="$2"
+  local dir
+  validate_json_file "${src}"
+  dir="$(dirname "${dst}")"
+  refuse_symlink_path "${dir}"
+  [[ -L "${dst}" ]] && fatal "symlink_refused" "Refusing to overwrite symlink file: ${dst}" "Replace the symlink with a real file."
+  local tmp
+  tmp="$(mktemp "${dir}/.tmp.XXXXXX")" || fatal "tmp_failed" "Failed to create temp file under ${dir}" "Check filesystem permissions."
+  cp "${src}" "${tmp}" || fatal "copy_failed" "Failed to copy ${src} to temp file." "Check filesystem permissions."
+  chmod 600 "${tmp}" || fatal "chmod_failed" "Failed to chmod 600: ${tmp}" "Check filesystem permissions."
+  mv -f "${tmp}" "${dst}" || fatal "rename_failed" "Failed to replace ${dst}" "Check filesystem permissions."
+  chmod 600 "${dst}" || fatal "chmod_failed" "Failed to chmod 600: ${dst}" "Check filesystem permissions."
+}
+
+atomic_copy_executable() {
+  local src="$1"
+  local dst="$2"
+  local dir
+  [[ -f "${src}" && ! -L "${src}" ]] || fatal "source_missing" "Install source is not a regular file: ${src}" "Run install from a real codex-auth-snap script."
+  dir="$(dirname "${dst}")"
+  refuse_symlink_path "${dir}"
+  [[ -L "${dst}" ]] && fatal "symlink_refused" "Refusing to overwrite symlink file: ${dst}" "Rerun install --force only after you verify the symlink should be replaced."
+  local tmp
+  tmp="$(mktemp "${dir}/.codex-auth-snap.tmp.XXXXXX")" || fatal "tmp_failed" "Failed to create temp file under ${dir}" "Check filesystem permissions."
+  cp "${src}" "${tmp}" || fatal "copy_failed" "Failed to copy ${src} to temp file." "Check filesystem permissions."
+  chmod 755 "${tmp}" || fatal "chmod_failed" "Failed to chmod 755: ${tmp}" "Check filesystem permissions."
+  mv -f "${tmp}" "${dst}" || fatal "rename_failed" "Failed to replace ${dst}" "Check filesystem permissions."
+  chmod 755 "${dst}" || fatal "chmod_failed" "Failed to chmod 755: ${dst}" "Check filesystem permissions."
+}
+
+snapshot_path() {
+  print -r -- "${ACCOUNTS_DIR}/${1}.auth.json"
+}
+
+meta_path() {
+  print -r -- "${META_DIR}/${1}.json"
+}
+
+hidden_auth_path() {
+  print -r -- "${BEFORE_LOGIN_DIR}/active-hidden.${1}.json"
+}
+
+cleanup_before_login_artifacts() {
+  local name="$1"
+  validate_name "${name}"
+  local hidden
+  hidden="$(hidden_auth_path "${name}")"
+  if [[ -e "${hidden}" || -L "${hidden}" ]]; then
+    refuse_symlink_path "${hidden}"
+    rm -f "${hidden}"
+  fi
+  local backup
+  for backup in "${BEFORE_LOGIN_DIR}/auth.before-login.${name}."*.json; do
+    refuse_symlink_path "${backup}"
+    rm -f "${backup}"
+  done
+}
+
+read_text_file() {
+  local file_path="$1"
+  [[ -f "${file_path}" && ! -L "${file_path}" ]] || return 1
+  local value
+  value="$(cat "${file_path}")"
+  print -r -- "${value}"
+}
+
+write_current() {
+  write_secure_text "${CURRENT_FILE}" "$1"
+}
+
+write_pending() {
+  write_secure_text "${PENDING_FILE}" "$1"
+}
+
+write_meta() {
+  local name="$1"
+  local source="$2"
+  local saved_file="$3"
+  local hash
+  hash="$(sha256_file "${saved_file}")"
+  local meta
+  meta="{\"name\":$(json_string "${name}"),\"saved_at\":$(json_string "$(now_iso)"),\"source\":$(json_string "${source}"),\"sha256\":$(json_string "${hash}"),\"codex_home\":$(json_string "${CODEX_HOME_DIR}")}"
+  write_secure_text "$(meta_path "${name}")" "${meta}"
+}
+
+write_install_meta() {
+  local install_path="$1"
+  local source_path="$2"
+  local hash="$3"
+  local meta
+  meta="{\"installed_at\":$(json_string "$(now_iso)"),\"install_path\":$(json_string "${install_path}"),\"source_path\":$(json_string "${source_path}"),\"version\":$(json_string "${VERSION}"),\"sha256\":$(json_string "${hash}")}"
+  write_secure_text "${INSTALL_META_FILE}" "${meta}"
+}
+
+stash_current() {
+  local current
+  current="$(read_text_file "${CURRENT_FILE}" 2>/dev/null || true)"
+  [[ -n "${current}" ]] || return 0
+  if ! name_is_valid "${current}"; then
+    warn "current account name is invalid; skipping active auth stash."
+    return 0
+  fi
+  [[ -e "${AUTH_FILE}" ]] || return 0
+  if ! auth_validation_status "${AUTH_FILE}" "${FORCE}"; then
+    warn "active auth.json is invalid or not a ChatGPT auth file; skipping active auth stash."
+    return 0
+  fi
+  local target
+  target="$(snapshot_path "${current}")"
+  atomic_copy "${AUTH_FILE}" "${target}"
+  write_meta "${current}" "${AUTH_FILE}" "${target}"
+}
+
+config_store_value() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    print -r -- "missing"
+    return
+  fi
+  local line
+  line="$(grep -E '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "${CONFIG_FILE}" | tail -n 1 || true)"
+  if [[ -z "${line}" ]]; then
+    print -r -- "unset"
+  elif print -r -- "${line}" | grep -Eq '"file"'; then
+    print -r -- "file"
+  else
+    print -r -- "non_file"
+  fi
+}
+
+set_config_file_backed() {
+  mkdir -p "${CODEX_HOME_DIR}" || fatal "mkdir_failed" "Failed to create ${CODEX_HOME_DIR}" "Check filesystem permissions."
+  refuse_symlink_path "${CONFIG_FILE}"
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    write_secure_text "${CONFIG_FILE}" 'cli_auth_credentials_store = "file"'
+    return
+  fi
+  local state
+  state="$(config_store_value)"
+  if [[ "${state}" == "file" ]]; then
+    return
+  fi
+  if [[ "${state}" == "unset" ]]; then
+    {
+      print -r -- ""
+      print -r -- 'cli_auth_credentials_store = "file"'
+    } >>"${CONFIG_FILE}" || fatal "write_failed" "Failed to update ${CONFIG_FILE}" "Check filesystem permissions."
+    chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
+    return
+  fi
+  if (( ! FORCE )); then
+    if [[ -t 0 ]]; then
+      print -u2 -- "cli_auth_credentials_store is not file. Replace it with file? [y/N]"
+      local answer
+      read -r answer
+      [[ "${answer}" == "y" || "${answer}" == "Y" ]] || fatal "config_store_not_file" "config.toml is not configured for file-backed auth." "Rerun with --fix --force to update it non-interactively."
+    else
+      fatal "config_store_not_file" "config.toml is not configured for file-backed auth." "Rerun with --fix --force to update it non-interactively."
+    fi
+  fi
+  local tmp
+  tmp="$(mktemp "${CODEX_HOME_DIR}/.config.tmp.XXXXXX")" || fatal "tmp_failed" "Failed to create config temp file." "Check filesystem permissions."
+  awk '
+    BEGIN { replaced = 0 }
+    /^[[:space:]]*cli_auth_credentials_store[[:space:]]*=/ {
+      if (replaced == 0) {
+        print "cli_auth_credentials_store = \"file\""
+        replaced = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (replaced == 0) {
+        print "cli_auth_credentials_store = \"file\""
+      }
+    }
+  ' "${CONFIG_FILE}" >"${tmp}" || fatal "write_failed" "Failed to rewrite ${CONFIG_FILE}" "Check filesystem permissions."
+  chmod 600 "${tmp}"
+  mv -f "${tmp}" "${CONFIG_FILE}" || fatal "rename_failed" "Failed to replace ${CONFIG_FILE}" "Check filesystem permissions."
+}
+
+cmd_init() {
+  ensure_dirs
+  acquire_lock
+  if (( FIX_CONFIG )); then
+    set_config_file_backed
+  fi
+  local config_state
+  config_state="$(config_store_value)"
+  if [[ "${config_state}" != "file" ]]; then
+    if (( FIX_CONFIG )); then
+      fatal "config_store_not_file" "config.toml is not configured for file-backed auth." "Inspect ${CONFIG_FILE}, then rerun with --fix --force if safe."
+    else
+      warn "config.toml is not configured for file-backed auth. Run: codex-auth-snap init --fix"
+    fi
+  fi
+  emit_ok "Initialized codex-auth-snap." "{\"command\":\"init\",\"codex_home\":$(json_string "${CODEX_HOME_DIR}"),\"snap_home\":$(json_string "${SWITCH_HOME_DIR}"),\"switch_home\":$(json_string "${SWITCH_HOME_DIR}"),\"config_state\":$(json_string "${config_state}")}"
+}
+
+cmd_install() {
+  local source_path
+  source_path="${SCRIPT_PATH}"
+  local bin_dir target source_hash target_hash already_current=false
+  bin_dir="$(selected_install_bin_dir)"
+  [[ -n "${bin_dir}" ]] || fatal "missing_argument" "install target directory is empty." "Pass --bin-dir <dir> or --prefix <dir>."
+  target="${bin_dir}/codex-auth-snap"
+
+  [[ -e "${bin_dir}" && -L "${bin_dir}" ]] && fatal "symlink_refused" "Refusing to install into symlink directory: ${bin_dir}" "Use a real directory for the installed command."
+  mkdir -p "${bin_dir}" || fatal "mkdir_failed" "Failed to create install directory: ${bin_dir}" "Check filesystem permissions."
+  [[ -d "${bin_dir}" ]] || fatal "not_directory" "Install target is not a directory: ${bin_dir}" "Pass --bin-dir <dir> pointing to a directory."
+
+  ensure_install_state_dirs
+  acquire_lock
+
+  if [[ -L "${target}" ]]; then
+    if (( ! FORCE )); then
+      fatal "install_target_symlink" "Install target is a symlink: ${target}" "Rerun install --force to replace it with a real copied script."
+    fi
+    rm -f "${target}" || fatal "remove_failed" "Failed to remove symlink install target: ${target}" "Check filesystem permissions."
+  fi
+
+  if [[ -e "${target}" ]]; then
+    [[ -f "${target}" ]] || fatal "not_regular_file" "Install target is not a regular file: ${target}" "Choose another --bin-dir or remove the path after inspection."
+    if ! looks_like_codex_auth_snap "${target}" && (( ! FORCE )); then
+      fatal "install_target_exists" "Install target exists and does not look like codex-auth-snap: ${target}" "Use --force only if you want to replace this file."
+    fi
+  fi
+
+  source_hash="$(sha256_file "${source_path}")"
+  if [[ -f "${target}" && ! -L "${target}" ]]; then
+    target_hash="$(sha256_file "${target}")"
+    if [[ "${target_hash}" == "${source_hash}" ]]; then
+      already_current=true
+    fi
+  fi
+
+  if [[ "${already_current}" != "true" ]]; then
+    atomic_copy_executable "${source_path}" "${target}"
+  fi
+  write_install_meta "${target}" "${source_path}" "${source_hash}"
+
+  local text
+  if [[ "${already_current}" == "true" ]]; then
+    text="codex-auth-snap is already installed: ${target}"
+  else
+    text="Installed codex-auth-snap to: ${target}"
+  fi
+  emit_ok "${text}" "{\"command\":\"install\",\"install_path\":$(json_string "${target}"),\"version\":$(json_string "${VERSION}"),\"sha256_short\":$(json_string "$(short_hash "${source_hash}")"),\"already_current\":${already_current}}"
+}
+
+cmd_save() {
+  local name="${1:-}"
+  [[ -n "${name}" ]] || fatal "missing_argument" "save requires <name>." "Run codex-auth-snap save <name>."
+  ensure_dirs
+  acquire_lock
+  validate_name "${name}"
+  validate_auth_file "${AUTH_FILE}" "${FORCE}"
+  local target
+  target="$(snapshot_path "${name}")"
+  atomic_copy "${AUTH_FILE}" "${target}"
+  write_current "${name}"
+  write_meta "${name}" "${AUTH_FILE}" "${target}"
+  local hash
+  hash="$(sha256_file "${target}")"
+  emit_ok "Saved current auth as: ${name}" "{\"command\":\"save\",\"name\":$(json_string "${name}"),\"snapshot\":$(json_string "${target}"),\"sha256_short\":$(json_string "$(short_hash "${hash}")"),\"has_refresh_token\":$(auth_has_refresh_token "${target}" && print -r -- true || print -r -- false)}"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [[ -n "${name}" ]] || fatal "missing_argument" "use requires <name>." "Run codex-auth-snap use <name>."
+  ensure_dirs
+  acquire_lock
+  validate_name "${name}"
+  local target
+  target="$(snapshot_path "${name}")"
+  [[ -e "${target}" ]] || fatal "snapshot_missing" "No saved auth snapshot for: ${name}" "Run codex-auth-snap list, or save/login this account first."
+  validate_auth_file "${target}" "${FORCE}"
+  stash_current
+  atomic_copy "${target}" "${AUTH_FILE}"
+  write_current "${name}"
+  local text
+  text="Switched to: ${name}
+Restart Codex CLI/App for the change to take effect."
+  emit_ok "${text}" "{\"command\":\"use\",\"name\":$(json_string "${name}"),\"auth_file\":$(json_string "${AUTH_FILE}")}"
+}
+
+cmd_begin_login() {
+  local name="${1:-}"
+  [[ -n "${name}" ]] || fatal "missing_argument" "begin-login requires <name>." "Run codex-auth-snap begin-login <name>."
+  ensure_dirs
+  acquire_lock
+  validate_name "${name}"
+  if [[ -f "${PENDING_FILE}" && ! -L "${PENDING_FILE}" ]]; then
+    fatal "pending_exists" "A pending login already exists: $(cat "${PENDING_FILE}")" "Run finish-login or abort-login before starting another login."
+  fi
+  local hidden
+  hidden="$(hidden_auth_path "${name}")"
+  if [[ -e "${hidden}" || -L "${hidden}" ]]; then
+    fatal "stale_hidden" "A stale before-login hidden auth exists for: ${name}" "Inspect or remove ${hidden}, then rerun begin-login."
+  fi
+  local backup=""
+  if [[ -e "${AUTH_FILE}" ]]; then
+    validate_auth_file "${AUTH_FILE}" "${FORCE}"
+    stash_current
+    local stamp
+    stamp="$(now_stamp)"
+    backup="${BEFORE_LOGIN_DIR}/auth.before-login.${name}.${stamp}.json"
+    [[ -L "${backup}" || -L "${hidden}" ]] && fatal "symlink_refused" "Refusing to write before-login backup through symlink." "Remove the symlink first."
+    cp "${AUTH_FILE}" "${backup}" || fatal "copy_failed" "Failed to write before-login backup." "Check filesystem permissions."
+    chmod 600 "${backup}"
+    mv "${AUTH_FILE}" "${hidden}" || fatal "move_failed" "Failed to hide active auth.json." "Check filesystem permissions."
+    chmod 600 "${hidden}"
+  fi
+  write_pending "${name}"
+  local text
+  text="Run codex login for the target account.
+Codex will open the login page. The account currently signed in to the browser does not decide which account gets saved.
+After login completes, run:
+  codex-auth-snap finish-login"
+  emit_ok "${text}" "{\"command\":\"begin-login\",\"name\":$(json_string "${name}"),\"pending_file\":$(json_string "${PENDING_FILE}"),\"hidden_auth\":$(json_string "${hidden}"),\"backup\":$(json_string "${backup}")}"
+}
+
+cmd_finish_login() {
+  local name="${1:-}"
+  ensure_dirs
+  acquire_lock
+  if [[ -z "${name}" ]]; then
+    name="$(read_text_file "${PENDING_FILE}" 2>/dev/null || true)"
+  fi
+  [[ -n "${name}" ]] || fatal "pending_missing" "No pending login and no account name was provided." "Run codex-auth-snap finish-login <name>, or start with begin-login."
+  validate_name "${name}"
+  validate_auth_file "${AUTH_FILE}" "${FORCE}"
+  local target
+  target="$(snapshot_path "${name}")"
+  atomic_copy "${AUTH_FILE}" "${target}"
+  write_current "${name}"
+  write_meta "${name}" "${AUTH_FILE}" "${target}"
+  cleanup_before_login_artifacts "${name}"
+  if [[ -e "${PENDING_FILE}" ]]; then
+    refuse_symlink_path "${PENDING_FILE}"
+    rm -f "${PENDING_FILE}"
+  fi
+  emit_ok "Saved new login as: ${name}" "{\"command\":\"finish-login\",\"name\":$(json_string "${name}"),\"snapshot\":$(json_string "${target}")}"
+}
+
+cmd_abort_login() {
+  ensure_dirs
+  acquire_lock
+  local pending
+  pending="$(read_text_file "${PENDING_FILE}" 2>/dev/null || true)"
+  [[ -n "${pending}" ]] || fatal "pending_missing" "No pending login to abort." "Nothing needs to be aborted."
+  validate_name "${pending}"
+  if [[ -e "${AUTH_FILE}" ]] && (( ! FORCE )); then
+    fatal "active_exists" "Active auth.json already exists; refusing to overwrite it." "Rerun abort-login --force only if you want to replace active auth.json."
+  fi
+  if [[ -e "${AUTH_FILE}" ]] && (( FORCE )); then
+    refuse_symlink_path "${AUTH_FILE}"
+    rm -f "${AUTH_FILE}"
+  fi
+  local hidden
+  hidden="$(hidden_auth_path "${pending}")"
+  [[ -e "${hidden}" || -L "${hidden}" ]] || fatal "hidden_missing" "No hidden active auth backup was found for: ${pending}" "Inspect ${BEFORE_LOGIN_DIR} and restore manually if needed."
+  refuse_symlink_path "${hidden}"
+  mv "${hidden}" "${AUTH_FILE}" || fatal "move_failed" "Failed to restore hidden auth.json." "Check filesystem permissions."
+  chmod 600 "${AUTH_FILE}"
+  rm -f "${PENDING_FILE}"
+  cleanup_before_login_artifacts "${pending}"
+  emit_ok "Aborted pending login and restored previous active auth." "{\"command\":\"abort-login\",\"restored\":$(json_string "${AUTH_FILE}"),\"pending_name\":$(json_string "${pending}")}"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [[ -n "${name}" ]] || fatal "missing_argument" "remove requires <name>." "Run codex-auth-snap remove <name>."
+  ensure_dirs
+  acquire_lock
+  validate_name "${name}"
+  local snapshot meta current
+  snapshot="$(snapshot_path "${name}")"
+  meta="$(meta_path "${name}")"
+  [[ -L "${snapshot}" || -L "${meta}" ]] && fatal "symlink_refused" "Refusing to remove symlink snapshot/meta for ${name}." "Remove suspicious symlinks manually after inspection."
+  rm -f "${snapshot}" "${meta}"
+  current="$(read_text_file "${CURRENT_FILE}" 2>/dev/null || true)"
+  if [[ "${current}" == "${name}" ]]; then
+    rm -f "${CURRENT_FILE}"
+    if (( ACTIVE_TOO )) && [[ -e "${AUTH_FILE}" ]]; then
+      refuse_symlink_path "${AUTH_FILE}"
+      rm -f "${AUTH_FILE}"
+    fi
+  fi
+  emit_ok "Removed snapshot: ${name}" "{\"command\":\"remove\",\"name\":$(json_string "${name}"),\"active_removed\":$([[ "${current}" == "${name}" && ${ACTIVE_TOO} -eq 1 ]] && print -r -- true || print -r -- false)}"
+}
+
+cmd_current() {
+  local current
+  current="$(read_text_file "${CURRENT_FILE}" 2>/dev/null || true)"
+  if [[ -z "${current}" ]]; then
+    emit_ok "(none)" "{\"command\":\"current\",\"name\":null}"
+  else
+    emit_ok "${current}" "{\"command\":\"current\",\"name\":$(json_string "${current}")}"
+  fi
+}
+
+extract_meta_field() {
+  local file_path="$1"
+  local field="$2"
+  plutil -extract "${field}" raw -o - "${file_path}" 2>/dev/null || true
+}
+
+cmd_list() {
+  ensure_dirs
+  local current
+  current="$(read_text_file "${CURRENT_FILE}" 2>/dev/null || true)"
+  local accounts_json=""
+  local text_lines=()
+  local file
+  for file in "${ACCOUNTS_DIR}"/*.auth.json; do
+    [[ -f "${file}" && ! -L "${file}" ]] || continue
+    local base name meta saved_at hash short is_current prefix
+    base="$(basename "${file}")"
+    name="${base%.auth.json}"
+    meta="$(meta_path "${name}")"
+    saved_at=""
+    if [[ -f "${meta}" && ! -L "${meta}" ]]; then
+      saved_at="$(extract_meta_field "${meta}" "saved_at")"
+    fi
+    hash="$(sha256_file "${file}")"
+    short="$(short_hash "${hash}")"
+    is_current=false
+    prefix=" "
+    if [[ "${name}" == "${current}" ]]; then
+      is_current=true
+      prefix="*"
+    fi
+    text_lines+=("${prefix} ${name}    saved ${saved_at:-unknown}    sha256 ${short}")
+    local item
+    item="{\"name\":$(json_string "${name}"),\"current\":${is_current},\"saved_at\":$(json_string "${saved_at}"),\"sha256_short\":$(json_string "${short}")}"
+    if [[ -z "${accounts_json}" ]]; then
+      accounts_json="${item}"
+    else
+      accounts_json="${accounts_json},${item}"
+    fi
+  done
+  local text
+  if (( ${#text_lines[@]} == 0 )); then
+    text="(none)"
+  else
+    text="${(F)text_lines}"
+  fi
+  emit_ok "${text}" "{\"command\":\"list\",\"current\":$(json_string "${current}"),\"accounts\":[${accounts_json}]}"
+}
+
+cmd_paths() {
+  local text
+  text="CODEX_HOME:      ${CODEX_HOME_DIR}
+AUTH_FILE:       ${AUTH_FILE}
+SNAP_HOME:       ${SWITCH_HOME_DIR}
+ACCOUNTS_DIR:    ${ACCOUNTS_DIR}
+CURRENT_FILE:    ${CURRENT_FILE}
+PENDING_FILE:    ${PENDING_FILE}"
+  emit_ok "${text}" "{\"command\":\"paths\",\"codex_home\":$(json_string "${CODEX_HOME_DIR}"),\"auth_file\":$(json_string "${AUTH_FILE}"),\"snap_home\":$(json_string "${SWITCH_HOME_DIR}"),\"switch_home\":$(json_string "${SWITCH_HOME_DIR}"),\"accounts_dir\":$(json_string "${ACCOUNTS_DIR}"),\"current_file\":$(json_string "${CURRENT_FILE}"),\"pending_file\":$(json_string "${PENDING_FILE}"),\"install_path\":$(json_string "$(selected_install_path)")}"
+}
+
+cmd_version() {
+  emit_ok "${VERSION}" "{\"command\":\"version\",\"version\":$(json_string "${VERSION}")}"
+}
+
+ISSUES=()
+DOCTOR_ERRORS=0
+
+add_issue() {
+  local severity="$1"
+  local code="$2"
+  local message="$3"
+  local file_path="${4:-}"
+  ISSUES+=("{\"severity\":$(json_string "${severity}"),\"code\":$(json_string "${code}"),\"message\":$(json_string "${message}"),\"path\":$(json_string "${file_path}")}")
+  [[ "${severity}" == "ERROR" ]] && DOCTOR_ERRORS=$((DOCTOR_ERRORS + 1))
+}
+
+check_mode() {
+  local file_path="$1"
+  local expected="$2"
+  local kind="$3"
+  [[ -e "${file_path}" ]] || return 0
+  local mode
+  mode="$(stat -f "%Lp" "${file_path}" 2>/dev/null || true)"
+  if [[ "${mode}" != "${expected}" ]]; then
+    add_issue "WARN" "bad_permissions" "${kind} should be ${expected}, got ${mode}" "${file_path}"
+  fi
+}
+
+is_cloud_path() {
+  local file_path="$1"
+  [[ "${file_path}" == *"iCloud Drive"* || "${file_path}" == *"Mobile Documents"* || "${file_path}" == *"Dropbox"* || "${file_path}" == *"Google Drive"* || "${file_path}" == *"OneDrive"* ]]
+}
+
+cmd_doctor() {
+  ISSUES=()
+  DOCTOR_ERRORS=0
+  [[ -L "${CODEX_HOME_DIR}" ]] && add_issue "ERROR" "symlink_refused" "CODEX_HOME is a symlink." "${CODEX_HOME_DIR}"
+  [[ -L "${SWITCH_HOME_DIR}" ]] && add_issue "ERROR" "symlink_refused" "snap home is a symlink." "${SWITCH_HOME_DIR}"
+  [[ -L "${AUTH_FILE}" ]] && add_issue "ERROR" "symlink_refused" "auth.json is a symlink." "${AUTH_FILE}"
+  [[ -f "${AUTH_FILE}" ]] || add_issue "WARN" "auth_missing" "auth.json does not exist." "${AUTH_FILE}"
+  if [[ -f "${AUTH_FILE}" && ! -L "${AUTH_FILE}" ]]; then
+    plutil -convert json -o /dev/null "${AUTH_FILE}" >/dev/null 2>&1 || add_issue "ERROR" "invalid_json" "auth.json is not valid JSON." "${AUTH_FILE}"
+    check_mode "${AUTH_FILE}" "600" "auth.json"
+  fi
+  local config_state
+  config_state="$(config_store_value)"
+  [[ "${config_state}" == "file" ]] || add_issue "WARN" "config_not_file_backed" "config.toml is not configured with cli_auth_credentials_store = \"file\"." "${CONFIG_FILE}"
+  local dir
+  for dir in "${SWITCH_HOME_DIR}" "${ACCOUNTS_DIR}" "${META_DIR}" "${BEFORE_LOGIN_DIR}"; do
+    [[ -L "${dir}" ]] && add_issue "ERROR" "symlink_refused" "state directory is a symlink." "${dir}"
+    [[ -d "${dir}" ]] || add_issue "WARN" "state_dir_missing" "state directory is missing." "${dir}"
+    check_mode "${dir}" "700" "state directory"
+  done
+  if [[ -f "${PENDING_FILE}" && ! -L "${PENDING_FILE}" ]]; then
+    add_issue "WARN" "pending_login" "pending-login exists." "${PENDING_FILE}"
+    check_mode "${PENDING_FILE}" "600" "pending-login"
+  elif [[ -L "${PENDING_FILE}" ]]; then
+    add_issue "ERROR" "symlink_refused" "pending-login is a symlink." "${PENDING_FILE}"
+  fi
+  local file
+  for file in "${ACCOUNTS_DIR}"/*.auth.json; do
+    if [[ -L "${file}" ]]; then
+      add_issue "ERROR" "symlink_refused" "auth snapshot is a symlink." "${file}"
+      continue
+    fi
+    [[ -f "${file}" ]] || continue
+    plutil -convert json -o /dev/null "${file}" >/dev/null 2>&1 || add_issue "ERROR" "invalid_json" "auth snapshot is not valid JSON." "${file}"
+    check_mode "${file}" "600" "auth snapshot"
+  done
+  for file in "${META_DIR}"/*.json "${CURRENT_FILE}"; do
+    [[ -e "${file}" ]] || continue
+    if [[ -L "${file}" ]]; then
+      add_issue "ERROR" "symlink_refused" "state file is a symlink." "${file}"
+      continue
+    fi
+    check_mode "${file}" "600" "state file"
+  done
+  if is_cloud_path "${SWITCH_HOME_DIR}"; then
+    add_issue "WARN" "cloud_synced_path" "auth snapshots are stored under a cloud-synced-looking path." "${SWITCH_HOME_DIR}"
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -f "Codex|codex" >/dev/null 2>&1; then
+    add_issue "WARN" "codex_running" "Codex App/CLI appears to be running; restart it after switching." ""
+  fi
+  local install_path meta_install_path install_status installed_version installed_hash source_path source_hash
+  install_path="$(selected_install_path)"
+  if [[ -f "${INSTALL_META_FILE}" && ! -L "${INSTALL_META_FILE}" && -z "${INSTALL_BIN_DIR}" && -z "${INSTALL_PREFIX}" ]]; then
+    meta_install_path="$(extract_meta_field "${INSTALL_META_FILE}" "install_path")"
+    [[ -n "${meta_install_path}" ]] && install_path="${meta_install_path}"
+  fi
+  install_status="missing"
+  installed_version=""
+  installed_hash=""
+  source_path="${SCRIPT_PATH}"
+  source_hash=""
+  if [[ -f "${source_path}" && ! -L "${source_path}" ]]; then
+    source_hash="$(sha256_file "${source_path}")"
+  fi
+  if [[ -L "${install_path}" ]]; then
+    install_status="symlink"
+    add_issue "WARN" "installed_path_symlink" "installed codex-auth-snap is a symlink; run install --force to replace it with a copied script." "${install_path}"
+  elif [[ ! -e "${install_path}" ]]; then
+    add_issue "WARN" "installed_missing" "installed codex-auth-snap was not found; run codex-auth-snap install if you want a stable path outside this checkout." "${install_path}"
+  elif [[ ! -f "${install_path}" ]]; then
+    install_status="not_regular"
+    add_issue "WARN" "installed_not_regular" "installed codex-auth-snap path is not a regular file." "${install_path}"
+  elif ! looks_like_codex_auth_snap "${install_path}"; then
+    install_status="unknown"
+    add_issue "WARN" "installed_unknown" "installed path does not look like codex-auth-snap." "${install_path}"
+  else
+    install_status="ok"
+    installed_version="$(extract_cli_version "${install_path}" 2>/dev/null || true)"
+    installed_hash="$(sha256_file "${install_path}")"
+    if [[ "${installed_version}" != "${VERSION}" ]]; then
+      install_status="version_mismatch"
+      add_issue "WARN" "installed_version_mismatch" "installed codex-auth-snap version ${installed_version:-unknown} differs from current ${VERSION}; rerun install." "${install_path}"
+    elif [[ -n "${source_hash}" && "${installed_hash}" != "${source_hash}" && "${install_path}" != "${source_path}" ]]; then
+      install_status="hash_mismatch"
+      add_issue "WARN" "installed_hash_mismatch" "installed codex-auth-snap differs from the current script even though the version matches; rerun install." "${install_path}"
+    fi
+  fi
+  local issues_json
+  issues_json="${(j:,:)ISSUES}"
+  local ok_json=true
+  (( DOCTOR_ERRORS > 0 )) && ok_json=false
+  local result
+  result="{\"command\":\"doctor\",\"version\":$(json_string "${VERSION}"),\"ok\":${ok_json},\"config_state\":$(json_string "${config_state}"),\"paths\":{\"codex_home\":$(json_string "${CODEX_HOME_DIR}"),\"auth_file\":$(json_string "${AUTH_FILE}"),\"snap_home\":$(json_string "${SWITCH_HOME_DIR}"),\"switch_home\":$(json_string "${SWITCH_HOME_DIR}")},\"installation\":{\"path\":$(json_string "${install_path}"),\"status\":$(json_string "${install_status}"),\"current_version\":$(json_string "${VERSION}"),\"installed_version\":$(json_string "${installed_version}"),\"source_sha256_short\":$(json_string "$(short_hash "${source_hash}")"),\"installed_sha256_short\":$(json_string "$(short_hash "${installed_hash}")")},\"issues\":[${issues_json}]}"
+  if (( DOCTOR_ERRORS > 0 )); then
+    if (( JSON_OUTPUT )); then
+      print -r -- "{\"content\":[{\"type\":\"text\",\"text\":\"codex-auth-snap doctor found errors.\"}],\"structuredContent\":{\"result\":${result},\"error\":{\"code\":\"doctor_failed\",\"message\":\"doctor found local safety errors\",\"retryable\":true,\"field_errors\":[],\"suggested_fix\":\"Inspect structuredContent.result.issues and fix ERROR entries.\"}},\"isError\":true}"
+    else
+      print -u2 -- "ERROR: doctor found local safety errors"
+      local issue
+      for issue in "${ISSUES[@]}"; do
+        print -u2 -- "${issue}"
+      done
+    fi
+    exit 1
+  fi
+  emit_ok "codex-auth-snap doctor OK." "${result}"
+}
+
+parse_args() {
+  local -a raw_args
+  raw_args=("$@")
+  local arg i
+  POSITIONAL=()
+  i=1
+  while (( i <= ${#raw_args[@]} )); do
+    arg="${raw_args[$i]}"
+    case "${arg}" in
+      --json) JSON_OUTPUT=1 ;;
+      --force) FORCE=1 ;;
+      --fix) FIX_CONFIG=1 ;;
+      --active-too) ACTIVE_TOO=1 ;;
+      --prefix)
+        i=$((i + 1))
+        (( i <= ${#raw_args[@]} )) || fatal "missing_argument" "--prefix requires a directory." "Pass --prefix <dir>."
+        INSTALL_PREFIX="${raw_args[$i]}"
+        ;;
+      --prefix=*) INSTALL_PREFIX="${arg#--prefix=}" ;;
+      --bin-dir)
+        i=$((i + 1))
+        (( i <= ${#raw_args[@]} )) || fatal "missing_argument" "--bin-dir requires a directory." "Pass --bin-dir <dir>."
+        INSTALL_BIN_DIR="${raw_args[$i]}"
+        ;;
+      --bin-dir=*) INSTALL_BIN_DIR="${arg#--bin-dir=}" ;;
+      --version) print -r -- "${VERSION}"; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      *) POSITIONAL+=("${arg}") ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+main() {
+  parse_args "$@"
+  local command="${POSITIONAL[1]:-}"
+  local args=()
+  local i
+  for (( i = 2; i <= ${#POSITIONAL[@]}; i++ )); do
+    args+=("${POSITIONAL[$i]}")
+  done
+  case "${command}" in
+    init) cmd_init "${args[@]}" ;;
+    save) cmd_save "${args[@]}" ;;
+    use) cmd_use "${args[@]}" ;;
+    begin-login) cmd_begin_login "${args[@]}" ;;
+    finish-login) cmd_finish_login "${args[@]}" ;;
+    abort-login) cmd_abort_login "${args[@]}" ;;
+    install) cmd_install "${args[@]}" ;;
+    list) cmd_list "${args[@]}" ;;
+    current) cmd_current "${args[@]}" ;;
+    remove) cmd_remove "${args[@]}" ;;
+    doctor) cmd_doctor "${args[@]}" ;;
+    paths) cmd_paths "${args[@]}" ;;
+    version) cmd_version "${args[@]}" ;;
+    "" ) usage; exit 0 ;;
+    *) fatal "unknown_command" "Unknown command: ${command}" "Run codex-auth-snap --help." ;;
+  esac
+}
+
+main "$@"
