@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.0 - 2026-06-13
+
+### Added
+
+- Linux support through an explicit platform layer.
+- GitHub Actions test coverage on both macOS and Ubuntu.
+
+### Changed
+
+- Replaced the zsh runtime with bash so Linux systems without zsh can run the CLI.
+- Split platform-sensitive helpers between macOS (`plutil`, BSD `stat`, `shasum`) and Linux (`python3`, GNU `stat`, `sha256sum`).
+- Updated docs to describe macOS and Linux support.
+
 ## 0.2.0 - 2026-06-07
 
 ### Added

@@ -12,7 +12,7 @@ In scope:
 - Clearer diagnostics.
 - Better docs.
 - Better tests.
-- macOS compatibility fixes.
+- macOS and Linux compatibility fixes.
 - Future portability work, if it preserves the same safety boundary.
 
 Out of scope:
@@ -35,7 +35,7 @@ From the repository root:
 Run the test suite:
 
 ```bash
-zsh tests/test_codex_auth_snap.sh
+bash tests/test_codex_auth_snap.sh
 ```
 
 The tests use temporary directories and do not touch your real `~/.codex`.
@@ -44,7 +44,7 @@ The tests use temporary directories and do not touch your real `~/.codex`.
 
 Check:
 
-- `zsh tests/test_codex_auth_snap.sh` passes.
+- `bash tests/test_codex_auth_snap.sh` passes.
 - `./codex-auth-snap --json version` prints valid JSON.
 - No real `auth.json` or `*.auth.json` file is included.
 - No docs or tests include real account names, tokens, screenshots, or credential material.

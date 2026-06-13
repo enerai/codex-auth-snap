@@ -1,9 +1,15 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -u
-setopt NULL_GLOB
+shopt -s nullglob
 
-VERSION="0.2.0"
-SCRIPT_PATH="${0:A}"
+VERSION="0.3.0"
+SCRIPT_PATH="$0"
+if [[ "${SCRIPT_PATH}" != */* ]] && command -v -- "${SCRIPT_PATH}" >/dev/null 2>&1; then
+  SCRIPT_PATH="$(command -v -- "${SCRIPT_PATH}")"
+fi
+if [[ "${SCRIPT_PATH}" != /* ]]; then
+  SCRIPT_PATH="${PWD}/${SCRIPT_PATH}"
+fi
 
 JSON_OUTPUT=0
 FORCE=0
@@ -34,6 +40,7 @@ INSTALL_META_FILE="${META_DIR}/install.json"
 LOCK_DIR="${SWITCH_HOME_DIR}/lock"
 
 LOCK_HELD=0
+HOST_OS="$(uname -s 2>/dev/null || printf '%s\n' unknown)"
 
 umask 077
 
@@ -66,11 +73,11 @@ json_escape() {
   value="${value//$'\n'/\\n}"
   value="${value//$'\r'/\\r}"
   value="${value//$'\t'/\\t}"
-  print -r -- "${value}"
+  printf '%s\n' "${value}"
 }
 
 json_string() {
-  print -r -- "\"$(json_escape "${1:-}")\""
+  printf '%s\n' "\"$(json_escape "${1:-}")\""
 }
 
 emit_ok() {
@@ -82,9 +89,9 @@ emit_ok() {
     result_json="{}"
   fi
   if (( JSON_OUTPUT )); then
-    print -r -- "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${text}")}],\"structuredContent\":{\"result\":${result_json}},\"isError\":false}"
+    printf '%s\n' "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${text}")}],\"structuredContent\":{\"result\":${result_json}},\"isError\":false}"
   else
-    print -r -- "${text}"
+    printf '%s\n' "${text}"
   fi
 }
 
@@ -94,9 +101,9 @@ emit_error() {
   local suggested_fix="${3:-Check the command arguments and local files, then retry.}"
   local retryable="${4:-false}"
   if (( JSON_OUTPUT )); then
-    print -r -- "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${message}")}],\"structuredContent\":{\"error\":{\"code\":$(json_string "${code}"),\"message\":$(json_string "${message}"),\"retryable\":${retryable},\"field_errors\":[],\"suggested_fix\":$(json_string "${suggested_fix}")}},\"isError\":true}"
+    printf '%s\n' "{\"content\":[{\"type\":\"text\",\"text\":$(json_string "${message}")}],\"structuredContent\":{\"error\":{\"code\":$(json_string "${code}"),\"message\":$(json_string "${message}"),\"retryable\":${retryable},\"field_errors\":[],\"suggested_fix\":$(json_string "${suggested_fix}")}},\"isError\":true}"
   else
-    print -u2 -- "ERROR: ${message}"
+    printf '%s\n' "ERROR: ${message}" >&2
   fi
 }
 
@@ -110,7 +117,7 @@ fatal() {
 }
 
 warn() {
-  print -u2 -- "WARN: $*"
+  printf '%s\n' "WARN: $*" >&2
 }
 
 cleanup_lock() {
@@ -123,6 +130,126 @@ trap cleanup_lock EXIT INT TERM
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fatal "dependency_missing" "Required command not found: $1" "Install or expose $1 on PATH before running codex-auth-snap."
+}
+
+require_supported_platform() {
+  case "${HOST_OS}" in
+    Darwin|Linux) ;;
+    *) fatal "unsupported_platform" "Unsupported platform: ${HOST_OS}" "codex-auth-snap supports macOS and Linux." ;;
+  esac
+}
+
+json_validate_platform() {
+  local file_path="$1"
+  require_supported_platform
+  case "${HOST_OS}" in
+    Darwin)
+      require_command plutil
+      plutil -convert json -o /dev/null "${file_path}" >/dev/null 2>&1
+      ;;
+    Linux)
+      require_command python3
+      python3 - "$file_path" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    json.load(handle)
+PY
+      ;;
+  esac
+}
+
+json_field_exists_platform() {
+  local file_path="$1"
+  local field="$2"
+  require_supported_platform
+  case "${HOST_OS}" in
+    Darwin)
+      require_command plutil
+      plutil -extract "${field}" json -o /dev/null "${file_path}" >/dev/null 2>&1
+      ;;
+    Linux)
+      require_command python3
+      python3 - "$file_path" "$field" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in field.split("."):
+    if isinstance(value, dict) and part in value:
+        value = value[part]
+    else:
+        sys.exit(1)
+PY
+      ;;
+  esac
+}
+
+json_extract_raw_platform() {
+  local file_path="$1"
+  local field="$2"
+  require_supported_platform
+  case "${HOST_OS}" in
+    Darwin)
+      require_command plutil
+      plutil -extract "${field}" raw -o - "${file_path}" 2>/dev/null
+      ;;
+    Linux)
+      require_command python3
+      python3 - "$file_path" "$field" <<'PY' 2>/dev/null
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in field.split("."):
+    if isinstance(value, dict) and part in value:
+        value = value[part]
+    else:
+        sys.exit(1)
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    print("null")
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value, separators=(",", ":")))
+else:
+    print(value)
+PY
+      ;;
+  esac
+}
+
+file_mode_platform() {
+  local file_path="$1"
+  require_supported_platform
+  case "${HOST_OS}" in
+    Darwin)
+      stat -f "%Lp" "${file_path}" 2>/dev/null
+      ;;
+    Linux)
+      stat -c "%a" "${file_path}" 2>/dev/null
+      ;;
+  esac
+}
+
+sha256_file_platform() {
+  local file_path="$1"
+  require_supported_platform
+  case "${HOST_OS}" in
+    Darwin)
+      require_command shasum
+      shasum -a 256 "${file_path}" | awk '{print $1}'
+      ;;
+    Linux)
+      require_command sha256sum
+      sha256sum "${file_path}" | awk '{print $1}'
+      ;;
+  esac
 }
 
 refuse_symlink_path() {
@@ -165,9 +292,9 @@ acquire_lock() {
 absolute_path() {
   local file_path="$1"
   if [[ "${file_path}" == /* ]]; then
-    print -r -- "${file_path}"
+    printf '%s\n' "${file_path}"
   else
-    print -r -- "${PWD}/${file_path}"
+    printf '%s\n' "${PWD}/${file_path}"
   fi
 }
 
@@ -177,17 +304,17 @@ selected_install_bin_dir() {
   elif [[ -n "${INSTALL_PREFIX}" ]]; then
     absolute_path "${INSTALL_PREFIX}/bin"
   else
-    print -r -- "${HOME}/.local/bin"
+    printf '%s\n' "${HOME}/.local/bin"
   fi
 }
 
 selected_install_path() {
-  print -r -- "$(selected_install_bin_dir)/codex-auth-snap"
+  printf '%s\n' "$(selected_install_bin_dir)/codex-auth-snap"
 }
 
 name_is_valid() {
   local name="${1:-}"
-  print -r -- "${name}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+  printf '%s\n' "${name}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 }
 
 validate_name() {
@@ -209,24 +336,23 @@ require_regular_file() {
 
 validate_json_file() {
   local file_path="$1"
-  require_command plutil
   require_regular_file "${file_path}" "file_missing" "Missing JSON file: ${file_path}"
-  plutil -convert json -o /dev/null "${file_path}" >/dev/null 2>&1 || fatal "invalid_json" "Invalid JSON file: ${file_path}" "Regenerate or fix the JSON file before retrying."
+  json_validate_platform "${file_path}" || fatal "invalid_json" "Invalid JSON file: ${file_path}" "Regenerate or fix the JSON file before retrying."
 }
 
 auth_looks_like_chatgpt() {
   local file_path="$1"
   local mode
-  mode="$(plutil -extract auth_mode raw -o - "${file_path}" 2>/dev/null || true)"
+  mode="$(json_extract_raw_platform "${file_path}" "auth_mode" 2>/dev/null || true)"
   if [[ "${mode}" == "chatgpt" ]]; then
     return 0
   fi
-  plutil -extract tokens json -o /dev/null "${file_path}" >/dev/null 2>&1
+  json_field_exists_platform "${file_path}" "tokens"
 }
 
 auth_has_refresh_token() {
   local file_path="$1"
-  plutil -extract tokens.refresh_token raw -o /dev/null "${file_path}" >/dev/null 2>&1
+  json_field_exists_platform "${file_path}" "tokens.refresh_token"
 }
 
 validate_auth_file() {
@@ -250,8 +376,7 @@ auth_validation_status() {
   refuse_symlink_path "${file_path}"
   [[ -f "${file_path}" ]] || fatal "not_regular_file" "Path is not a regular file: ${file_path}" "Replace it with a regular file."
   [[ -s "${file_path}" ]] || return 1
-  require_command plutil
-  plutil -convert json -o /dev/null "${file_path}" >/dev/null 2>&1 || return 1
+  json_validate_platform "${file_path}" || return 1
   if ! auth_looks_like_chatgpt "${file_path}"; then
     (( allow_force )) && return 0
     return 1
@@ -260,13 +385,12 @@ auth_validation_status() {
 }
 
 sha256_file() {
-  require_command shasum
-  shasum -a 256 "$1" | awk '{print $1}'
+  sha256_file_platform "$1"
 }
 
 short_hash() {
   local hash="$1"
-  print -r -- "${hash[1,12]}"
+  printf '%s\n' "${hash:0:12}"
 }
 
 extract_cli_version() {
@@ -276,7 +400,7 @@ extract_cli_version() {
   line="$(grep -E '^VERSION="[^"]+"' "${file_path}" | head -n 1 || true)"
   [[ -n "${line}" ]] || return 1
   line="${line#VERSION=\"}"
-  print -r -- "${line%%\"*}"
+  printf '%s\n' "${line%%\"*}"
 }
 
 looks_like_codex_auth_snap() {
@@ -302,7 +426,7 @@ write_secure_text() {
   refuse_symlink_path "${dir}"
   local tmp
   tmp="$(mktemp "${dir}/.tmp.XXXXXX")" || fatal "tmp_failed" "Failed to create temp file under ${dir}" "Check filesystem permissions."
-  print -r -- "${text}" >"${tmp}" || fatal "write_failed" "Failed to write temp file: ${tmp}" "Check filesystem permissions."
+  printf '%s\n' "${text}" >"${tmp}" || fatal "write_failed" "Failed to write temp file: ${tmp}" "Check filesystem permissions."
   chmod 600 "${tmp}" || fatal "chmod_failed" "Failed to chmod 600: ${tmp}" "Check filesystem permissions."
   if [[ -L "${file_path}" ]]; then
     rm -f "${tmp}" 2>/dev/null || true
@@ -345,15 +469,15 @@ atomic_copy_executable() {
 }
 
 snapshot_path() {
-  print -r -- "${ACCOUNTS_DIR}/${1}.auth.json"
+  printf '%s\n' "${ACCOUNTS_DIR}/${1}.auth.json"
 }
 
 meta_path() {
-  print -r -- "${META_DIR}/${1}.json"
+  printf '%s\n' "${META_DIR}/${1}.json"
 }
 
 hidden_auth_path() {
-  print -r -- "${BEFORE_LOGIN_DIR}/active-hidden.${1}.json"
+  printf '%s\n' "${BEFORE_LOGIN_DIR}/active-hidden.${1}.json"
 }
 
 cleanup_before_login_artifacts() {
@@ -377,7 +501,7 @@ read_text_file() {
   [[ -f "${file_path}" && ! -L "${file_path}" ]] || return 1
   local value
   value="$(cat "${file_path}")"
-  print -r -- "${value}"
+  printf '%s\n' "${value}"
 }
 
 write_current() {
@@ -429,17 +553,17 @@ stash_current() {
 
 config_store_value() {
   if [[ ! -f "${CONFIG_FILE}" ]]; then
-    print -r -- "missing"
+    printf '%s\n' "missing"
     return
   fi
   local line
   line="$(grep -E '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "${CONFIG_FILE}" | tail -n 1 || true)"
   if [[ -z "${line}" ]]; then
-    print -r -- "unset"
-  elif print -r -- "${line}" | grep -Eq '"file"'; then
-    print -r -- "file"
+    printf '%s\n' "unset"
+  elif printf '%s\n' "${line}" | grep -Eq '"file"'; then
+    printf '%s\n' "file"
   else
-    print -r -- "non_file"
+    printf '%s\n' "non_file"
   fi
 }
 
@@ -457,15 +581,15 @@ set_config_file_backed() {
   fi
   if [[ "${state}" == "unset" ]]; then
     {
-      print -r -- ""
-      print -r -- 'cli_auth_credentials_store = "file"'
+      printf '%s\n' ""
+      printf '%s\n' 'cli_auth_credentials_store = "file"'
     } >>"${CONFIG_FILE}" || fatal "write_failed" "Failed to update ${CONFIG_FILE}" "Check filesystem permissions."
     chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
     return
   fi
   if (( ! FORCE )); then
     if [[ -t 0 ]]; then
-      print -u2 -- "cli_auth_credentials_store is not file. Replace it with file? [y/N]"
+      printf '%s\n' "cli_auth_credentials_store is not file. Replace it with file? [y/N]" >&2
       local answer
       read -r answer
       [[ "${answer}" == "y" || "${answer}" == "Y" ]] || fatal "config_store_not_file" "config.toml is not configured for file-backed auth." "Rerun with --fix --force to update it non-interactively."
@@ -578,7 +702,11 @@ cmd_save() {
   write_meta "${name}" "${AUTH_FILE}" "${target}"
   local hash
   hash="$(sha256_file "${target}")"
-  emit_ok "Saved current auth as: ${name}" "{\"command\":\"save\",\"name\":$(json_string "${name}"),\"snapshot\":$(json_string "${target}"),\"sha256_short\":$(json_string "$(short_hash "${hash}")"),\"has_refresh_token\":$(auth_has_refresh_token "${target}" && print -r -- true || print -r -- false)}"
+  local has_refresh_token=false
+  if auth_has_refresh_token "${target}"; then
+    has_refresh_token=true
+  fi
+  emit_ok "Saved current auth as: ${name}" "{\"command\":\"save\",\"name\":$(json_string "${name}"),\"snapshot\":$(json_string "${target}"),\"sha256_short\":$(json_string "$(short_hash "${hash}")"),\"has_refresh_token\":${has_refresh_token}}"
 }
 
 cmd_use() {
@@ -703,7 +831,11 @@ cmd_remove() {
       rm -f "${AUTH_FILE}"
     fi
   fi
-  emit_ok "Removed snapshot: ${name}" "{\"command\":\"remove\",\"name\":$(json_string "${name}"),\"active_removed\":$([[ "${current}" == "${name}" && ${ACTIVE_TOO} -eq 1 ]] && print -r -- true || print -r -- false)}"
+  local active_removed=false
+  if [[ "${current}" == "${name}" && ${ACTIVE_TOO} -eq 1 ]]; then
+    active_removed=true
+  fi
+  emit_ok "Removed snapshot: ${name}" "{\"command\":\"remove\",\"name\":$(json_string "${name}"),\"active_removed\":${active_removed}}"
 }
 
 cmd_current() {
@@ -719,7 +851,7 @@ cmd_current() {
 extract_meta_field() {
   local file_path="$1"
   local field="$2"
-  plutil -extract "${field}" raw -o - "${file_path}" 2>/dev/null || true
+  json_extract_raw_platform "${file_path}" "${field}" 2>/dev/null || true
 }
 
 cmd_list() {
@@ -760,7 +892,8 @@ cmd_list() {
   if (( ${#text_lines[@]} == 0 )); then
     text="(none)"
   else
-    text="${(F)text_lines}"
+    printf -v text '%s\n' "${text_lines[@]}"
+    text="${text%$'\n'}"
   fi
   emit_ok "${text}" "{\"command\":\"list\",\"current\":$(json_string "${current}"),\"accounts\":[${accounts_json}]}"
 }
@@ -798,7 +931,7 @@ check_mode() {
   local kind="$3"
   [[ -e "${file_path}" ]] || return 0
   local mode
-  mode="$(stat -f "%Lp" "${file_path}" 2>/dev/null || true)"
+  mode="$(file_mode_platform "${file_path}" 2>/dev/null || true)"
   if [[ "${mode}" != "${expected}" ]]; then
     add_issue "WARN" "bad_permissions" "${kind} should be ${expected}, got ${mode}" "${file_path}"
   fi
@@ -817,7 +950,7 @@ cmd_doctor() {
   [[ -L "${AUTH_FILE}" ]] && add_issue "ERROR" "symlink_refused" "auth.json is a symlink." "${AUTH_FILE}"
   [[ -f "${AUTH_FILE}" ]] || add_issue "WARN" "auth_missing" "auth.json does not exist." "${AUTH_FILE}"
   if [[ -f "${AUTH_FILE}" && ! -L "${AUTH_FILE}" ]]; then
-    plutil -convert json -o /dev/null "${AUTH_FILE}" >/dev/null 2>&1 || add_issue "ERROR" "invalid_json" "auth.json is not valid JSON." "${AUTH_FILE}"
+    json_validate_platform "${AUTH_FILE}" || add_issue "ERROR" "invalid_json" "auth.json is not valid JSON." "${AUTH_FILE}"
     check_mode "${AUTH_FILE}" "600" "auth.json"
   fi
   local config_state
@@ -842,7 +975,7 @@ cmd_doctor() {
       continue
     fi
     [[ -f "${file}" ]] || continue
-    plutil -convert json -o /dev/null "${file}" >/dev/null 2>&1 || add_issue "ERROR" "invalid_json" "auth snapshot is not valid JSON." "${file}"
+    json_validate_platform "${file}" || add_issue "ERROR" "invalid_json" "auth snapshot is not valid JSON." "${file}"
     check_mode "${file}" "600" "auth snapshot"
   done
   for file in "${META_DIR}"/*.json "${CURRENT_FILE}"; do
@@ -897,19 +1030,24 @@ cmd_doctor() {
     fi
   fi
   local issues_json
-  issues_json="${(j:,:)ISSUES}"
+  if (( ${#ISSUES[@]} == 0 )); then
+    issues_json=""
+  else
+    local IFS=,
+    issues_json="${ISSUES[*]}"
+  fi
   local ok_json=true
   (( DOCTOR_ERRORS > 0 )) && ok_json=false
   local result
   result="{\"command\":\"doctor\",\"version\":$(json_string "${VERSION}"),\"ok\":${ok_json},\"config_state\":$(json_string "${config_state}"),\"paths\":{\"codex_home\":$(json_string "${CODEX_HOME_DIR}"),\"auth_file\":$(json_string "${AUTH_FILE}"),\"snap_home\":$(json_string "${SWITCH_HOME_DIR}"),\"switch_home\":$(json_string "${SWITCH_HOME_DIR}")},\"installation\":{\"path\":$(json_string "${install_path}"),\"status\":$(json_string "${install_status}"),\"current_version\":$(json_string "${VERSION}"),\"installed_version\":$(json_string "${installed_version}"),\"source_sha256_short\":$(json_string "$(short_hash "${source_hash}")"),\"installed_sha256_short\":$(json_string "$(short_hash "${installed_hash}")")},\"issues\":[${issues_json}]}"
   if (( DOCTOR_ERRORS > 0 )); then
     if (( JSON_OUTPUT )); then
-      print -r -- "{\"content\":[{\"type\":\"text\",\"text\":\"codex-auth-snap doctor found errors.\"}],\"structuredContent\":{\"result\":${result},\"error\":{\"code\":\"doctor_failed\",\"message\":\"doctor found local safety errors\",\"retryable\":true,\"field_errors\":[],\"suggested_fix\":\"Inspect structuredContent.result.issues and fix ERROR entries.\"}},\"isError\":true}"
+      printf '%s\n' "{\"content\":[{\"type\":\"text\",\"text\":\"codex-auth-snap doctor found errors.\"}],\"structuredContent\":{\"result\":${result},\"error\":{\"code\":\"doctor_failed\",\"message\":\"doctor found local safety errors\",\"retryable\":true,\"field_errors\":[],\"suggested_fix\":\"Inspect structuredContent.result.issues and fix ERROR entries.\"}},\"isError\":true}"
     else
-      print -u2 -- "ERROR: doctor found local safety errors"
+      printf '%s\n' "ERROR: doctor found local safety errors" >&2
       local issue
       for issue in "${ISSUES[@]}"; do
-        print -u2 -- "${issue}"
+        printf '%s\n' "${issue}" >&2
       done
     fi
     exit 1
@@ -918,60 +1056,64 @@ cmd_doctor() {
 }
 
 parse_args() {
-  local -a raw_args
-  raw_args=("$@")
-  local arg i
+  local arg
   POSITIONAL=()
-  i=1
-  while (( i <= ${#raw_args[@]} )); do
-    arg="${raw_args[$i]}"
+  while (( $# > 0 )); do
+    arg="$1"
     case "${arg}" in
       --json) JSON_OUTPUT=1 ;;
       --force) FORCE=1 ;;
       --fix) FIX_CONFIG=1 ;;
       --active-too) ACTIVE_TOO=1 ;;
       --prefix)
-        i=$((i + 1))
-        (( i <= ${#raw_args[@]} )) || fatal "missing_argument" "--prefix requires a directory." "Pass --prefix <dir>."
-        INSTALL_PREFIX="${raw_args[$i]}"
+        shift
+        (( $# > 0 )) || fatal "missing_argument" "--prefix requires a directory." "Pass --prefix <dir>."
+        INSTALL_PREFIX="$1"
         ;;
       --prefix=*) INSTALL_PREFIX="${arg#--prefix=}" ;;
       --bin-dir)
-        i=$((i + 1))
-        (( i <= ${#raw_args[@]} )) || fatal "missing_argument" "--bin-dir requires a directory." "Pass --bin-dir <dir>."
-        INSTALL_BIN_DIR="${raw_args[$i]}"
+        shift
+        (( $# > 0 )) || fatal "missing_argument" "--bin-dir requires a directory." "Pass --bin-dir <dir>."
+        INSTALL_BIN_DIR="$1"
         ;;
       --bin-dir=*) INSTALL_BIN_DIR="${arg#--bin-dir=}" ;;
-      --version) print -r -- "${VERSION}"; exit 0 ;;
+      --version) printf '%s\n' "${VERSION}"; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       *) POSITIONAL+=("${arg}") ;;
     esac
-    i=$((i + 1))
+    shift
   done
 }
 
 main() {
   parse_args "$@"
-  local command="${POSITIONAL[1]:-}"
+  local command="${POSITIONAL[0]:-}"
   local args=()
-  local i
-  for (( i = 2; i <= ${#POSITIONAL[@]}; i++ )); do
-    args+=("${POSITIONAL[$i]}")
-  done
+  if (( ${#POSITIONAL[@]} > 1 )); then
+    args=("${POSITIONAL[@]:1}")
+  fi
+  call_with_args() {
+    local fn="$1"
+    if (( ${#args[@]} > 0 )); then
+      "${fn}" "${args[@]}"
+    else
+      "${fn}"
+    fi
+  }
   case "${command}" in
-    init) cmd_init "${args[@]}" ;;
-    save) cmd_save "${args[@]}" ;;
-    use) cmd_use "${args[@]}" ;;
-    begin-login) cmd_begin_login "${args[@]}" ;;
-    finish-login) cmd_finish_login "${args[@]}" ;;
-    abort-login) cmd_abort_login "${args[@]}" ;;
-    install) cmd_install "${args[@]}" ;;
-    list) cmd_list "${args[@]}" ;;
-    current) cmd_current "${args[@]}" ;;
-    remove) cmd_remove "${args[@]}" ;;
-    doctor) cmd_doctor "${args[@]}" ;;
-    paths) cmd_paths "${args[@]}" ;;
-    version) cmd_version "${args[@]}" ;;
+    init) call_with_args cmd_init ;;
+    save) call_with_args cmd_save ;;
+    use) call_with_args cmd_use ;;
+    begin-login) call_with_args cmd_begin_login ;;
+    finish-login) call_with_args cmd_finish_login ;;
+    abort-login) call_with_args cmd_abort_login ;;
+    install) call_with_args cmd_install ;;
+    list) call_with_args cmd_list ;;
+    current) call_with_args cmd_current ;;
+    remove) call_with_args cmd_remove ;;
+    doctor) call_with_args cmd_doctor ;;
+    paths) call_with_args cmd_paths ;;
+    version) call_with_args cmd_version ;;
     "" ) usage; exit 0 ;;
     *) fatal "unknown_command" "Unknown command: ${command}" "Run codex-auth-snap --help." ;;
   esac

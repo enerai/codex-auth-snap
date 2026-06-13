@@ -24,7 +24,7 @@ If it is not available, open a GitHub issue with a minimal description that does
 Good reports include:
 
 - The `codex-auth-snap version` output.
-- Your macOS version.
+- Your operating system and version.
 - The exact command you ran.
 - The non-sensitive `doctor` issue code, if one is available.
 - A redacted explanation of what went wrong.

@@ -1,5 +1,6 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 set -euo pipefail
+shopt -s nullglob
 
 TEST_DIR="$(cd "$(dirname "${0}")" && pwd)"
 TOOL_DIR="$(cd "${TEST_DIR}/.." && pwd)"
@@ -11,7 +12,7 @@ trap 'rm -rf "${TMP_ROOT}"' EXIT
 TEST_INDEX=0
 
 fail() {
-  print -u2 "FAIL: $*"
+  printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
 
@@ -26,7 +27,7 @@ assert_contains() {
   local file_path="$1"
   local needle="$2"
   grep -Fq "${needle}" "${file_path}" || {
-    print -u2 -- "--- ${file_path} ---"
+    printf '%s\n' "--- ${file_path} ---" >&2
     cat "${file_path}" >&2
     fail "missing expected text: ${needle}"
   }
@@ -36,10 +37,20 @@ assert_not_contains() {
   local file_path="$1"
   local needle="$2"
   if grep -Fq "${needle}" "${file_path}"; then
-    print -u2 -- "--- ${file_path} ---"
+    printf '%s\n' "--- ${file_path} ---" >&2
     cat "${file_path}" >&2
     fail "unexpected sensitive text: ${needle}"
   fi
+}
+
+file_mode() {
+  local file_path="$1"
+  local mode
+  if mode="$(stat -c "%a" "${file_path}" 2>/dev/null)"; then
+    printf '%s\n' "${mode}"
+    return
+  fi
+  stat -f "%Lp" "${file_path}"
 }
 
 assert_file_exists() {
@@ -53,21 +64,21 @@ assert_file_missing() {
 assert_dir_mode() {
   local file_path="$1"
   local mode
-  mode="$(stat -f "%Lp" "${file_path}")"
+  mode="$(file_mode "${file_path}")"
   assert_eq "700" "${mode}" "dir mode ${file_path}"
 }
 
 assert_file_mode() {
   local file_path="$1"
   local mode
-  mode="$(stat -f "%Lp" "${file_path}")"
+  mode="$(file_mode "${file_path}")"
   assert_eq "600" "${mode}" "file mode ${file_path}"
 }
 
 assert_executable_mode() {
   local file_path="$1"
   local mode
-  mode="$(stat -f "%Lp" "${file_path}")"
+  mode="$(file_mode "${file_path}")"
   assert_eq "755" "${mode}" "executable mode ${file_path}"
 }
 
@@ -76,7 +87,13 @@ assert_valid_json_file() {
 }
 
 assert_json_stdout() {
-  python3 -m json.tool "${STDOUT_FILE}" >/dev/null
+  python3 -m json.tool "${STDOUT_FILE}" >/dev/null || {
+    printf '%s\n' "--- stdout ---" >&2
+    cat "${STDOUT_FILE}" >&2 || true
+    printf '%s\n' "--- stderr ---" >&2
+    cat "${STDERR_FILE}" >&2 || true
+    fail "expected JSON stdout"
+  }
 }
 
 json_get() {
@@ -133,6 +150,30 @@ echo "codex $*" >>"${FAKE_CALL_LOG}"
 exit 0
 SH
   chmod +x "${FAKE_BIN_DIR}/codex"
+  cat >"${FAKE_BIN_DIR}/uname" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-s" && -n "${FAKE_UNAME_S:-}" ]]; then
+  printf '%s\n' "${FAKE_UNAME_S}"
+  exit 0
+fi
+/usr/bin/uname "$@"
+SH
+  chmod +x "${FAKE_BIN_DIR}/uname"
+  cat >"${FAKE_BIN_DIR}/stat" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then
+  /usr/bin/stat -f "%Lp" "$3"
+  exit 0
+fi
+/usr/bin/stat "$@"
+SH
+  chmod +x "${FAKE_BIN_DIR}/stat"
+  cat >"${FAKE_BIN_DIR}/sha256sum" <<'SH'
+#!/usr/bin/env bash
+hash="$(shasum -a 256 "$1" | awk '{print $1}')"
+printf '%s  %s\n' "${hash}" "$1"
+SH
+  chmod +x "${FAKE_BIN_DIR}/sha256sum"
 }
 
 write_auth() {
@@ -169,6 +210,7 @@ run_cli() {
   set +e
   PATH="${FAKE_BIN_DIR}:${PATH}" \
   HOME="${HOME_DIR}" \
+  FAKE_UNAME_S="${FAKE_UNAME_S:-}" \
   FAKE_CALL_LOG="${CALL_LOG}" \
   CODEX_HOME="${CODEX_HOME_DIR}" \
   CODEX_AUTH_SNAP_HOME="${SWITCH_HOME_DIR}" \
@@ -176,13 +218,61 @@ run_cli() {
   local exit_status=$?
   set -e
   if [[ "${exit_status}" -ne "${expected}" ]]; then
-    print -u2 -- "command failed with unexpected status ${exit_status}, expected ${expected}: ${CLI} $*"
-    print -u2 -- "--- stdout ---"
+    printf '%s\n' "command failed with unexpected status ${exit_status}, expected ${expected}: ${CLI} $*" >&2
+    printf '%s\n' "--- stdout ---" >&2
     cat "${STDOUT_FILE}" >&2 || true
-    print -u2 -- "--- stderr ---"
+    printf '%s\n' "--- stderr ---" >&2
     cat "${STDERR_FILE}" >&2 || true
     exit 1
   fi
+}
+
+test_cli_is_bash_compatible() {
+  bash -n "${CLI}" || fail "codex-auth-snap must parse with bash"
+
+  new_case
+  set +e
+  PATH="${FAKE_BIN_DIR}:${PATH}" \
+  HOME="${HOME_DIR}" \
+  FAKE_UNAME_S="${FAKE_UNAME_S:-}" \
+  FAKE_CALL_LOG="${CALL_LOG}" \
+  CODEX_HOME="${CODEX_HOME_DIR}" \
+  CODEX_AUTH_SNAP_HOME="${SWITCH_HOME_DIR}" \
+  bash "${CLI}" --json version >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+  local exit_status=$?
+  set -e
+  assert_eq "0" "${exit_status}" "bash version status"
+  assert_json_stdout
+  assert_eq "0.3.0" "$(json_get structuredContent.result.version)" "bash version output"
+}
+
+test_linux_platform_helpers_do_not_require_plutil() {
+  new_case
+  local FAKE_UNAME_S=Linux
+  cat >"${FAKE_BIN_DIR}/plutil" <<'SH'
+#!/usr/bin/env bash
+echo "plutil should not be used in Linux mode" >&2
+exit 127
+SH
+  chmod +x "${FAKE_BIN_DIR}/plutil"
+
+  run_cli 0 --json init --fix
+  write_auth "${CODEX_HOME_DIR}/auth.json" "linux"
+  run_cli 0 --json save linux
+  assert_json_stdout
+  assert_eq "linux" "$(json_get structuredContent.result.name)" "linux save account"
+  assert_file_exists "${SWITCH_HOME_DIR}/accounts/linux.auth.json"
+  assert_file_mode "${SWITCH_HOME_DIR}/accounts/linux.auth.json"
+  assert_not_contains "${STDERR_FILE}" "plutil should not be used"
+
+  run_cli 0 --json list
+  assert_json_stdout
+  assert_eq "linux" "$(json_get structuredContent.result.accounts.0.name)" "linux list account"
+
+  run_cli 0 --json doctor
+  assert_json_stdout
+  assert_eq "true" "$(json_get structuredContent.result.ok)" "linux doctor ok"
+  assert_not_contains "${STDERR_FILE}" "plutil should not be used"
 }
 
 test_init_fix_creates_dirs_and_config() {
@@ -199,7 +289,7 @@ test_init_fix_creates_dirs_and_config() {
 
   new_case
   mkdir -p "${CODEX_HOME_DIR}"
-  print -r -- 'model = "gpt-5.5"' >"${CODEX_HOME_DIR}/config.toml"
+  printf '%s\n' 'model = "gpt-5.5"' >"${CODEX_HOME_DIR}/config.toml"
   run_cli 0 --json init --fix
   assert_contains "${CODEX_HOME_DIR}/config.toml" 'cli_auth_credentials_store = "file"'
   assert_not_contains "${CODEX_HOME_DIR}/config.toml" '\ncli_auth_credentials_store'
@@ -217,7 +307,7 @@ test_install_copies_executable_to_user_bin() {
   assert_executable_mode "${install_bin}/codex-auth-snap"
   assert_file_exists "${SWITCH_HOME_DIR}/meta/install.json"
   assert_file_mode "${SWITCH_HOME_DIR}/meta/install.json"
-  assert_contains "${install_bin}/codex-auth-snap" 'VERSION="0.2.0"'
+  assert_contains "${install_bin}/codex-auth-snap" 'VERSION="0.3.0"'
   assert_not_contains "${STDOUT_FILE}" "fake-refresh"
 }
 
@@ -225,8 +315,8 @@ test_install_refuses_unrelated_existing_file_without_force() {
   new_case
   local install_bin="${CASE_ROOT}/install-bin"
   mkdir -p "${install_bin}"
-  print -r -- '#!/bin/sh' >"${install_bin}/codex-auth-snap"
-  print -r -- 'echo unrelated' >>"${install_bin}/codex-auth-snap"
+  printf '%s\n' '#!/bin/sh' >"${install_bin}/codex-auth-snap"
+  printf '%s\n' 'echo unrelated' >>"${install_bin}/codex-auth-snap"
   chmod 755 "${install_bin}/codex-auth-snap"
 
   run_cli 1 --json install --bin-dir "${install_bin}"
@@ -243,10 +333,10 @@ test_doctor_reports_installed_version_mismatch() {
   local install_bin="${CASE_ROOT}/install-bin"
   mkdir -p "${install_bin}"
   cat >"${install_bin}/codex-auth-snap" <<'SH'
-#!/bin/zsh
+#!/usr/bin/env bash
 VERSION="0.0.1"
 usage() {
-  print -r -- "Local Codex ChatGPT auth.json snapshot switcher"
+  printf '%s\n' "Local Codex ChatGPT auth.json snapshot switcher"
 }
 SH
   chmod 755 "${install_bin}/codex-auth-snap"
@@ -330,7 +420,7 @@ test_use_recovers_from_corrupt_active_auth() {
   run_cli 0 save personal
   write_auth "${CODEX_HOME_DIR}/auth.json" "work"
   run_cli 0 save work
-  print -r -- "{not json" >"${CODEX_HOME_DIR}/auth.json"
+  printf '%s\n' "{not json" >"${CODEX_HOME_DIR}/auth.json"
   chmod 600 "${CODEX_HOME_DIR}/auth.json"
 
   run_cli 0 --json use personal
@@ -381,7 +471,7 @@ test_begin_login_hides_active_writes_pending_and_never_calls_logout() {
   assert_eq "work" "$(cat "${SWITCH_HOME_DIR}/pending-login")" "pending login"
   assert_contains "${SWITCH_HOME_DIR}/accounts/personal.auth.json" "fake-refresh-personal-rotated"
   assert_file_exists "${SWITCH_HOME_DIR}/before-login/active-hidden.work.json"
-  local backups=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json(N))
+  local backups=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json)
   (( ${#backups[@]} == 1 )) || fail "expected one work before-login backup, got ${#backups[@]}"
   [[ ! -s "${CALL_LOG}" ]] || fail "codex command should not be called"
   assert_not_contains "${STDOUT_FILE}" "fake-refresh-personal-rotated"
@@ -428,7 +518,7 @@ test_finish_login_uses_pending_and_clears_it() {
   assert_eq "work" "$(cat "${SWITCH_HOME_DIR}/current")" "current after finish"
   assert_file_missing "${SWITCH_HOME_DIR}/pending-login"
   assert_file_missing "${SWITCH_HOME_DIR}/before-login/active-hidden.work.json"
-  local leftovers=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json(N))
+  local leftovers=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json)
   (( ${#leftovers[@]} == 0 )) || fail "expected finish-login to clean work backups, got ${#leftovers[@]}"
 
   new_case
@@ -453,7 +543,7 @@ test_abort_login_restores_named_hidden_auth_without_overwriting_active() {
   assert_contains "${CODEX_HOME_DIR}/auth.json" "fake-refresh-personal"
   assert_file_missing "${SWITCH_HOME_DIR}/pending-login"
   assert_file_missing "${SWITCH_HOME_DIR}/before-login/active-hidden.work.json"
-  local work_backups=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json(N))
+  local work_backups=("${SWITCH_HOME_DIR}/before-login"/auth.before-login.work.*.json)
   (( ${#work_backups[@]} == 0 )) || fail "expected abort-login to clean work backups, got ${#work_backups[@]}"
 
   run_cli 0 begin-login work
@@ -521,7 +611,7 @@ test_doctor_healthy_state_returns_ok() {
 test_invalid_json_and_lock_conflict_are_rejected() {
   new_case
   run_cli 0 init --fix
-  print '{not json' >"${CODEX_HOME_DIR}/auth.json"
+  printf '%s\n' '{not json' >"${CODEX_HOME_DIR}/auth.json"
   chmod 600 "${CODEX_HOME_DIR}/auth.json"
   run_cli 1 --json save broken
   assert_json_stdout
@@ -571,7 +661,7 @@ test_codex_auth_switch_legacy_env_var_is_accepted() {
 test_init_fix_force_replaces_non_file_credentials_store() {
   new_case
   mkdir -p "${CODEX_HOME_DIR}"
-  print -r -- 'cli_auth_credentials_store = "memory"' >"${CODEX_HOME_DIR}/config.toml"
+  printf '%s\n' 'cli_auth_credentials_store = "memory"' >"${CODEX_HOME_DIR}/config.toml"
 
   run_cli 0 --json init --fix --force
   assert_json_stdout
@@ -580,6 +670,8 @@ test_init_fix_force_replaces_non_file_credentials_store() {
 }
 
 run_all() {
+  test_cli_is_bash_compatible
+  test_linux_platform_helpers_do_not_require_plutil
   test_init_fix_creates_dirs_and_config
   test_install_copies_executable_to_user_bin
   test_install_refuses_unrelated_existing_file_without_force
@@ -603,7 +695,7 @@ run_all() {
   test_codex_auth_switch_legacy_env_var_is_accepted
   test_codex_swap_legacy_env_var_is_accepted
   test_init_fix_force_replaces_non_file_credentials_store
-  print "ok - codex-auth-snap tests passed"
+  printf '%s\n' "ok - codex-auth-snap tests passed"
 }
 
 run_all

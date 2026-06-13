@@ -2,9 +2,9 @@
 
 English | [中文](README.zh-CN.md)
 
-Tiny, auditable, offline Codex ChatGPT `auth.json` snapshot switcher for macOS, built for high-volume coding workflows with multiple authorized ChatGPT accounts.
+Tiny, auditable, offline Codex ChatGPT `auth.json` snapshot switcher for macOS and Linux, built for high-volume coding workflows with multiple authorized ChatGPT accounts.
 
-`codex-auth-snap` is a minimal zsh CLI for developers who code a lot with Codex and want a clean way to switch between their own authorized ChatGPT accounts on one machine. It saves and restores local `auth.json` snapshots. It has no third-party runtime dependencies, does not install a dependency tree, does not call the network, and never prints credential contents.
+`codex-auth-snap` is a minimal bash CLI for developers who code a lot with Codex and want a clean way to switch between their own authorized ChatGPT accounts on one machine. It saves and restores local `auth.json` snapshots. It has no third-party runtime dependencies, does not install a dependency tree, does not call the network, and never prints credential contents.
 
 This project is not affiliated with OpenAI.
 
@@ -16,7 +16,7 @@ Codex ChatGPT auth can be stored in:
 $CODEX_HOME/auth.json
 ```
 
-If you have more than one authorized Codex account on the same Mac, switching accounts is really a local file operation: save the current `auth.json`, restore another one, then restart Codex so it rereads the file.
+If you have more than one authorized Codex account on the same Mac or Linux machine, switching accounts is really a local file operation: save the current `auth.json`, restore another one, then restart Codex so it rereads the file.
 
 This tool makes that workflow explicit, repeatable, and easy to inspect.
 
@@ -33,9 +33,9 @@ It is not for credential sharing, account pooling, or policy evasion.
 
 ## Highlights
 
-- **Tiny CLI logic**: one zsh script, direct file operations, no daemon, no background service.
+- **Tiny CLI logic**: one bash script, direct file operations, no daemon, no background service.
 - **Zero third-party runtime dependencies**: no npm package tree, no pip environment, no bundled dependency chain.
-- **Smaller supply-chain attack surface**: the first public release depends only on zsh and standard macOS tools such as `plutil` and BSD `stat`.
+- **Smaller supply-chain attack surface**: the CLI uses platform-native system tools: `plutil`, BSD `stat`, and `shasum` on macOS; `python3`, GNU `stat`, and `sha256sum` on Linux.
 - **Offline by design**: no network requests, no OpenAI API calls, no telemetry.
 - **Concrete safety properties**: strict file permissions, symlink refusal, bounded JSON output, token redaction, cloud-sync warnings.
 - **Easy to audit**: the core behavior is in a single shell script, and the test suite uses temporary directories only.
@@ -55,12 +55,14 @@ ChatGPT Plus account switcher
 multiple ChatGPT accounts
 multiple Codex accounts
 switch ChatGPT accounts on macOS
+switch ChatGPT accounts on Linux
 offline CLI
 no dependency CLI
 zero dependency shell script
 supply chain safe CLI
 local-first auth switcher
-macOS zsh CLI
+macOS bash CLI
+Linux bash CLI
 ```
 
 Suggested GitHub topics:
@@ -75,7 +77,8 @@ auth-switcher
 account-switcher
 chatgpt-plus
 macos
-zsh
+linux
+bash
 cli
 offline
 no-dependencies
@@ -121,13 +124,17 @@ Only use this tool with accounts that you own or are explicitly authorized to us
 
 ## Platform Support
 
-First public release scope:
+Supported platforms:
 
 - macOS
-- zsh
+- Linux
+- bash
 - Codex configured for file-backed ChatGPT auth
 
-Linux support is not claimed yet.
+Platform-specific system tools are intentionally handled in separate code paths:
+
+- macOS: `plutil`, BSD `stat`, `shasum`
+- Linux: `python3`, GNU `stat`, `sha256sum`
 
 ## Install
 
@@ -317,7 +324,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md).
 The test suite uses temporary directories and does not touch your real `~/.codex`:
 
 ```bash
-zsh tests/test_codex_auth_snap.sh
+bash tests/test_codex_auth_snap.sh
 ```
 
 ## License

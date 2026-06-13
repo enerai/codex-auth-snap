@@ -2,9 +2,9 @@
 
 [English](README.md) | 中文
 
-极简, 可审计, 完全离线的 Codex ChatGPT `auth.json` 快照切换工具, 适用于编程量大的多 ChatGPT 账号 macOS 用户.
+极简, 可审计, 完全离线的 Codex ChatGPT `auth.json` 快照切换工具, 适用于编程量大的多 ChatGPT 账号 macOS 和 Linux 用户.
 
-`codex-auth-snap` 是一个极简 zsh CLI, 面向高频使用 Codex 编程, 且持有多个 ChatGPT 账号的开发者. 它用来在同一台 Mac 上切换你自己拥有或被明确授权使用的 Codex ChatGPT 账号. 它只保存和恢复本机 `auth.json` 快照. 它没有第三方运行时依赖, 不安装依赖树, 不联网, 也不会打印任何凭据内容.
+`codex-auth-snap` 是一个极简 bash CLI, 面向高频使用 Codex 编程, 且持有多个 ChatGPT 账号的开发者. 它用来在同一台 Mac 或 Linux 机器上切换你自己拥有或被明确授权使用的 Codex ChatGPT 账号. 它只保存和恢复本机 `auth.json` 快照. 它没有第三方运行时依赖, 不安装依赖树, 不联网, 也不会打印任何凭据内容.
 
 本项目与 OpenAI 没有关联.
 
@@ -16,7 +16,7 @@ Codex ChatGPT auth 可以保存在:
 $CODEX_HOME/auth.json
 ```
 
-如果你编程量很大, 经常用 Codex 做代码生成, 重构, 调试和长时间 agentic coding, 并且在同一台 Mac 上有多个被授权使用的 ChatGPT / Codex 账号, 切换账号本质上只是一个本机文件操作: 保存当前 `auth.json`, 恢复另一个 `auth.json`, 然后重启 Codex 让它重新读取这个文件.
+如果你编程量很大, 经常用 Codex 做代码生成, 重构, 调试和长时间 agentic coding, 并且在同一台 Mac 或 Linux 机器上有多个被授权使用的 ChatGPT / Codex 账号, 切换账号本质上只是一个本机文件操作: 保存当前 `auth.json`, 恢复另一个 `auth.json`, 然后重启 Codex 让它重新读取这个文件.
 
 这个工具把这套流程做成明确, 可重复, 容易审计的 CLI.
 
@@ -33,9 +33,9 @@ $CODEX_HOME/auth.json
 
 ## 宣传卖点
 
-- **极简 CLI 逻辑**: 一个 zsh 脚本, 直接做本机文件操作, 没有 daemon, 没有后台服务.
+- **极简 CLI 逻辑**: 一个 bash 脚本, 直接做本机文件操作, 没有 daemon, 没有后台服务.
 - **零第三方运行时依赖**: 没有 npm 依赖树, 没有 pip 环境, 没有打包进来的传递依赖.
-- **更小的供应链攻击面**: 首个公开版本只依赖 zsh 和 macOS 标准工具, 例如 `plutil` 和 BSD `stat`.
+- **更小的供应链攻击面**: CLI 使用系统自带工具. macOS 分支使用 `plutil`, BSD `stat` 和 `shasum`; Linux 分支使用 `python3`, GNU `stat` 和 `sha256sum`.
 - **设计上完全离线**: 不发网络请求, 不调用 OpenAI API, 不上传 telemetry.
 - **具体可验证的安全属性**: 严格文件权限, 拒绝 symlink, 有界 JSON 输出, token 脱敏, 云同步目录风险提醒.
 - **容易审计**: 核心行为都在一个 shell 脚本里, 测试只使用临时目录.
@@ -57,6 +57,7 @@ ChatGPT Plus 多账号
 编程量大 ChatGPT 账号切换
 高频编程 Codex 账号切换
 macOS Codex 工具
+Linux Codex 工具
 离线 CLI
 无依赖 CLI
 零依赖 shell 脚本
@@ -76,7 +77,8 @@ auth-switcher
 account-switcher
 chatgpt-plus
 macos
-zsh
+linux
+bash
 cli
 offline
 no-dependencies
@@ -122,13 +124,17 @@ local-first
 
 ## 平台支持
 
-首个公开版本范围:
+支持的平台:
 
 - macOS
-- zsh
+- Linux
+- bash
 - Codex 已配置为 file-backed ChatGPT auth
 
-当前还不声明 Linux 支持.
+平台相关的系统组件分开处理:
+
+- macOS: `plutil`, BSD `stat`, `shasum`
+- Linux: `python3`, GNU `stat`, `sha256sum`
 
 ## 安装
 
@@ -318,7 +324,7 @@ codex-auth-snap --json doctor
 测试只使用临时目录, 不会触碰真实 `~/.codex`:
 
 ```bash
-zsh tests/test_codex_auth_snap.sh
+bash tests/test_codex_auth_snap.sh
 ```
 
 ## 许可证

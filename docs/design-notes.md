@@ -67,6 +67,9 @@ This makes the CLI easier for scripts and coding agents to call safely. It also 
 
 ## Platform Notes
 
-The first public release targets macOS. The script uses zsh, `plutil`, and BSD `stat -f`.
+The CLI supports macOS and Linux through explicit platform dispatch instead of command probing.
 
-Linux support would require a portability pass for JSON validation, JSON field checks, file mode inspection, and process detection.
+- macOS uses bash plus `plutil`, BSD `stat -f`, and `shasum`.
+- Linux uses bash plus `python3`, GNU `stat -c`, and `sha256sum`.
+
+The shared command flow stays in one script, while JSON validation, JSON field checks, file mode inspection, and hashing stay behind platform-specific helpers.

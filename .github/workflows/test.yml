@@ -6,15 +6,19 @@ on:
   pull_request:
 
 jobs:
-  zsh-tests:
-    name: zsh tests on macOS
-    runs-on: macos-latest
+  shell-tests:
+    name: shell tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Check shell syntax
-        run: zsh -n codex-auth-snap
+        run: bash -n codex-auth-snap
 
       - name: Run shell test suite
-        run: zsh tests/test_codex_auth_snap.sh
+        run: bash tests/test_codex_auth_snap.sh

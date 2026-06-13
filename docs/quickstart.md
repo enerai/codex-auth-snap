@@ -179,5 +179,5 @@ Use `--active-too` only when you are sure the active `auth.json` belongs to the 
 The tests use temporary directories and do not touch your real `~/.codex`:
 
 ```bash
-zsh tests/test_codex_auth_snap.sh
+bash tests/test_codex_auth_snap.sh
 ```

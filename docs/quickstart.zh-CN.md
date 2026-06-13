@@ -179,5 +179,5 @@ codex-auth-snap remove work --active-too
 测试只使用临时目录, 不会触碰真实 `~/.codex`:
 
 ```bash
-zsh tests/test_codex_auth_snap.sh
+bash tests/test_codex_auth_snap.sh
 ```
