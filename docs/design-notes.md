@@ -67,9 +67,18 @@ This makes the CLI easier for scripts and coding agents to call safely. It also 
 
 ## Platform Notes
 
-The CLI supports macOS and Linux through explicit platform dispatch instead of command probing.
+The CLI supports macOS and Linux through explicit platform dispatch in the bash script instead of command probing.
 
 - macOS uses bash plus `plutil`, BSD `stat -f`, and `shasum`.
 - Linux uses bash plus `python3`, GNU `stat -c`, and `sha256sum`.
 
 The shared command flow stays in one script, while JSON validation, JSON field checks, file mode inspection, and hashing stay behind platform-specific helpers.
+
+Windows support lives in a separate PowerShell script instead of adding Windows branches to the bash entrypoint.
+
+- Windows uses `codex-auth-snap.ps1`.
+- The PowerShell script keeps the same command names, `--json` envelope shape, state layout, legacy environment variables, and no-network behavior.
+- Windows does not have POSIX `600`/`700` modes. The PowerShell script refuses reparse points and uses best-effort ACL tightening for the current user.
+- PowerShell-native JSON parsing, hashing, copy/move operations, and ACL APIs replace `plutil`, `python3`, `stat`, `shasum`, and `sha256sum`.
+
+The two scripts are intentionally separate so that macOS/Linux behavior remains auditable as bash, while Windows behavior can use normal PowerShell and Windows filesystem APIs.
